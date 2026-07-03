@@ -1,5 +1,7 @@
 import re
 import json
+from urllib.parse import quote
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -772,36 +774,49 @@ async def get_search_suggestions(q: str):
 
 @app.get("/search")
 async def get_search_results(q: str):
-    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search"
-    payload = {"keyword": q, "perPage": 30, "page": 1}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json"
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=15)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Search API failed")
-        
-    data = resp.json()
-    items = data.get("data", {}).get("items", [])
-    
+    # The h5-api subject/search endpoint now requires a signed token
+    # (returns 400 "invalid token"), so scrape the SSR search results page
+    # and pull the subjects out of __NUXT_DATA__ instead — same approach
+    # as /detail/{slug}.
+    _, raw = await fetch_tab(f"/web/searchResult?keyword={quote(q)}")
+
+    match = re.search(r'<script[^>]+id="__NUXT_DATA__"[^>]*>(.*?)</script>', raw, re.DOTALL)
+    if not match:
+        raise HTTPException(status_code=502, detail="Could not find NUXT data in search page")
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Failed to parse NUXT data")
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail="Unexpected NUXT data format")
+
     movies = []
-    for sub in items:
-        name = sub.get("title")
-        poster = sub.get("cover", {}).get("url")
+    seen_ids: set = set()
+    for i, v in enumerate(data):
+        if not (isinstance(v, dict) and "subjectId" in v and "title" in v and "detailPath" in v):
+            continue
+        sub = _resolve_nuxt_data(data, i)
         detail_path = sub.get("detailPath")
-        
+        subject_id = sub.get("subjectId")
+        if not detail_path or subject_id in seen_ids:
+            continue
+        seen_ids.add(subject_id)
+
+        cover = sub.get("cover") if isinstance(sub.get("cover"), dict) else {}
         movies.append({
-            "name": name,
-            "poster_url": poster,
-            "url": BASE_URL + f"/detail/{detail_path}" if detail_path else None,
+            "name": sub.get("title"),
+            "poster_url": cover.get("url"),
+            "url": BASE_URL + f"/detail/{detail_path}",
             "slug": detail_path,
+            "subject_id": subject_id,
+            "detail_path": detail_path,
+            "subject_type": sub.get("subjectType"),
+            "release_date": sub.get("releaseDate"),
+            "imdb_rating": sub.get("imdbRatingValue"),
             "badge": sub.get("corner"),
-            "blurhash": sub.get("cover", {}).get("blurHash")
+            "blurhash": cover.get("blurHash")
         })
-        
+
     return {
         "query": q,
         "count": len(movies),
