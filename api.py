@@ -838,8 +838,7 @@ async def get_ranking_section(name: str):
 @app.get("/api/stream/{subject_id}")
 async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
     domain_url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/media-player/get-domain"
-    domain = "https://123movienow.cc" 
-    
+
     headers = {
         "User-Agent": "Mozilla/5.0",
         "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
@@ -847,66 +846,121 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
         "X-App-Version": "1.0.0"
     }
 
+    # The player API lives on several interchangeable domains. Some of them
+    # block datacenter IPs (403), and without the full browser header set
+    # (referer + sec-fetch-*) they answer hasResource=False or omit the HD
+    # URLs — so try each domain with real browser headers until one returns
+    # usable streams.
+    domains = []
+    errors = []
+    best = None  # (max usable resolution, domain, data) seen so far
+
     async with httpx.AsyncClient() as client:
         try:
             r_dom = await client.get(domain_url, headers=headers, timeout=5)
             if r_dom.status_code == 200:
-                dom_data = r_dom.json()
-                domain = dom_data.get("data", domain)
-                if domain.endswith("/"):
-                    domain = domain[:-1]
+                domain = r_dom.json().get("data", "")
+                if domain:
+                    domains.append(domain.rstrip("/"))
         except Exception as e:
-            print(f"Warning: Failed to fetch player domain, using fallback: {e}")
-            pass
-            
-        play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-        
-        play_headers = {
-            'accept': 'application/json',
-            'accept-language': 'en-US,en;q=0.9',
-            'referer': f'{domain}/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe=&detailEp=&lang=en',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-            'x-client-info': '{"timezone":"Asia/Dhaka"}',
-            'x-source': ''
-        }
-        
-        cookies = {
-            "uuid": "d8c3539e-2e46-4000-af20-7046a856e30a" 
-        }
+            print(f"Warning: Failed to fetch player domain: {e}")
 
-        resp = await client.get(play_url, headers=play_headers, cookies=cookies, timeout=15)
-        
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Player API returned {resp.status_code}")
-            
-        data = resp.json()
-        streams = data.get("data", {}).get("streams", [])
-        
-        if not streams:
-            raise HTTPException(status_code=404, detail="No streams found or hasResource is False.")
-            
-        formatted_streams = []
-        for s in streams:
-            formatted_streams.append({
-                "resolution": s.get("resolutions") + "p" if s.get("resolutions") else "Unknown",
-                "format": s.get("format"),
-                "url": s.get("url"),
-                "size_bytes": s.get("size"),
-                "id": s.get("id")
-            })
-            
-        try:
-            formatted_streams.sort(key=lambda x: int(x["resolution"].replace("p", "")), reverse=True)
-        except:
-             pass
+        for fallback in ("https://h5-api.aoneroom.com", "https://moviebox.ph", "https://123movienow.cc"):
+            if fallback not in domains:
+                domains.append(fallback)
 
-        return {
-            "subject_id": subject_id,
-            "detail_path": detail_path,
-            "season": se,
-            "episode": ep,
-            "stream_domain": domain,
-            "count": len(formatted_streams),
-            "sources": formatted_streams,
-            "raw": data.get("data", {})
-        }
+        for domain in domains:
+            play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={quote(detail_path)}"
+
+            play_headers = {
+                'accept': 'application/json',
+                'accept-language': 'en-US,en;q=0.9',
+                'referer': f'{domain}/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe=&detailEp=&lang=en',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+                'x-client-info': '{"timezone":"Asia/Dhaka"}',
+                'x-source': '',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin'
+            }
+
+            cookies = {
+                "uuid": "d8c3539e-2e46-4000-af20-7046a856e30a"
+            }
+
+            try:
+                resp = await client.get(play_url, headers=play_headers, cookies=cookies, timeout=15)
+            except Exception as e:
+                errors.append(f"{domain}: {e}")
+                continue
+
+            if resp.status_code != 200:
+                errors.append(f"{domain}: HTTP {resp.status_code}")
+                continue
+
+            try:
+                data = resp.json().get("data", {}) or {}
+            except Exception:
+                errors.append(f"{domain}: non-JSON response")
+                continue
+
+            streams = data.get("streams", [])
+            if not streams:
+                errors.append(f"{domain}: no streams (hasResource={data.get('hasResource')})")
+                continue
+
+            # Some domains lock the top resolutions (empty url). Return
+            # immediately only when the highest advertised resolution is
+            # usable; otherwise remember the best partial answer and keep
+            # trying other domains.
+            max_advertised = max((_res_value(s) for s in streams), default=0)
+            max_usable = max((_res_value(s) for s in streams if s.get("url")), default=0)
+
+            if max_usable == 0:
+                errors.append(f"{domain}: all stream URLs empty")
+                continue
+            if max_usable >= max_advertised:
+                return _format_stream_response(subject_id, detail_path, se, ep, domain, data)
+            errors.append(f"{domain}: best usable {max_usable}p < advertised {max_advertised}p")
+            if best is None or max_usable > best[0]:
+                best = (max_usable, domain, data)
+
+    if best is not None:
+        return _format_stream_response(subject_id, detail_path, se, ep, best[1], best[2])
+
+    raise HTTPException(status_code=502, detail={"message": "All player domains failed", "errors": errors})
+
+def _res_value(stream: dict) -> int:
+    try:
+        return int(str(stream.get("resolutions", "")).replace("p", ""))
+    except (ValueError, TypeError):
+        return 0
+
+def _format_stream_response(subject_id: str, detail_path: str, se: int, ep: int, domain: str, data: dict) -> dict:
+    formatted_streams = []
+    for s in data.get("streams", []):
+        if not s.get("url"):
+            continue
+        formatted_streams.append({
+            "resolution": s.get("resolutions") + "p" if s.get("resolutions") else "Unknown",
+            "format": s.get("format"),
+            "url": s.get("url"),
+            "size_bytes": s.get("size"),
+            "id": s.get("id")
+        })
+
+    try:
+        formatted_streams.sort(key=lambda x: int(x["resolution"].replace("p", "")), reverse=True)
+    except:
+        pass
+
+    return {
+        "subject_id": subject_id,
+        "detail_path": detail_path,
+        "season": se,
+        "episode": ep,
+        "stream_domain": domain,
+        "count": len(formatted_streams),
+        "sources": formatted_streams,
+        "raw": data
+    }
